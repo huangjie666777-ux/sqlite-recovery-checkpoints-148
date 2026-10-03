@@ -25,6 +25,7 @@ MIGRATION_TABLE = "__schema_migration_log__"
 @dataclass(frozen=True)
 class Settings:
     aliases: dict[str, Path]
+    checkpoint_dir: Path
 
 
 def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
@@ -40,4 +41,8 @@ def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
         aliases[alias] = p.resolve()
     if not aliases:
         raise ValueError("aliases.json must define at least one alias")
-    return Settings(aliases=aliases)
+    cp_raw = raw.get("checkpoint_dir", "checkpoints")
+    cp = Path(cp_raw)
+    if not cp.is_absolute():
+        cp = cfg_path.parent / cp
+    return Settings(aliases=aliases, checkpoint_dir=cp.resolve())

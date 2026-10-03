@@ -2,5 +2,6 @@
   "aliases": {
     "demo": "data/demo.db",
     "billing": "data/billing.db"
-  }
+  },
+  "checkpoint_dir": "checkpoints"
 }

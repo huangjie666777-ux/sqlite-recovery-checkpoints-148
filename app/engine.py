@@ -11,6 +11,7 @@ from pathlib import Path
 from .config import MIGRATION_TABLE, SQLITE_BUSY_TIMEOUT_SECONDS
 from .guard import GuardError, inspect_script, make_authorizer
 from .manifest import MigrationItem, MigrationManifest, sql_digest
+from .sqlsplit import TokenizeError
 
 
 class MigrationError(Exception):
@@ -151,54 +152,50 @@ def _apply_locked(db_path: Path, manifest: MigrationManifest) -> ApplyResult:
         try:
             conn.execute("PRAGMA busy_timeout = %d" % int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000))
             conn.execute("PRAGMA foreign_keys = ON")
-            _ensure_table(conn)
-            records = _read_records(conn)
-            current = records[-1].version if records else 0
-
-            if current != manifest.expected_version:
-                raise VersionConflict(
-                    f"expected_version={manifest.expected_version} but database is at {current}"
-                )
-            _check_history(records, manifest.scripts)
-
-            pending = manifest.scripts[current:]
-            before = current
-
-            if not pending:
-                return ApplyResult(
-                    before_version=before, after_version=current, applied=[]
-                )
-
-            # 全部待执行脚本先做语句层校验，任何一条不合法都不动数据库。
-            parsed: list[tuple[MigrationItem, list[str]]] = []
-            authorizer = make_authorizer(MIGRATION_TABLE)
-            def _allow_all(*_args):
-                return sqlite3.SQLITE_OK
-
-            for item in pending:
-                statements = inspect_script(item.sql, MIGRATION_TABLE)
-                parsed.append((item, statements))
-
-            conn.set_authorizer(authorizer)
+            # 先取得数据库写锁，再在事务内检查版本与历史，
+            # 避免检查与写入之间被其它写入者插队。
+            conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.execute("BEGIN IMMEDIATE")
+                _ensure_table(conn)
+                records = _read_records(conn)
+                current = records[-1].version if records else 0
+
+                if current != manifest.expected_version:
+                    raise VersionConflict(
+                        f"expected_version={manifest.expected_version} but database is at {current}"
+                    )
+                _check_history(records, manifest.scripts)
+
+                pending = manifest.scripts[current:]
+                before = current
+
+                if not pending:
+                    conn.execute("COMMIT")
+                    return ApplyResult(
+                        before_version=before, after_version=current, applied=[]
+                    )
+
+                # 全部待执行脚本先做语句层校验，任何一条不合法都不动数据库。
+                # 禁用 SQL 属于业务拒绝，返回失败版本而不是 HTTP 500。
+                parsed: list[tuple[MigrationItem, list[str]]] = []
+                authorizer = make_authorizer(MIGRATION_TABLE)
+
+                def _allow_all(*_args):
+                    return sqlite3.SQLITE_OK
+
+                for item in pending:
+                    try:
+                        statements = inspect_script(item.sql, MIGRATION_TABLE)
+                    except (GuardError, TokenizeError) as exc:
+                        raise ScriptFailed(item.version, f"rejected sql: {exc}") from exc
+                    parsed.append((item, statements))
+
+                conn.set_authorizer(authorizer)
                 applied: list[int] = []
                 for item, statements in parsed:
                     try:
                         for stmt in statements:
                             conn.execute(stmt)
-                        # 每条脚本后立刻核对外键完整性，违反则整批回滚。
-                        conn.set_authorizer(_allow_all)
-                        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-                        conn.set_authorizer(authorizer)
-                        if violations:
-                            detail = ", ".join(
-                                f"table={v[0]} rowid={v[1]} target={v[2]} fkid={v[3]}"
-                                for v in violations[:5]
-                            )
-                            raise ScriptFailed(
-                                item.version, f"foreign key violation: {detail}"
-                            )
                         conn.set_authorizer(_allow_all)
                         conn.execute(
                             f"INSERT INTO {MIGRATION_TABLE} (version, description, sql_sha256) "
@@ -215,6 +212,18 @@ def _apply_locked(db_path: Path, manifest: MigrationManifest) -> ApplyResult:
                                 item.version, "foreign key constraint violation"
                             ) from exc
                         raise ScriptFailed(item.version, str(exc)) from exc
+                # 外键（含延迟外键）在整批末尾统一验证，
+                # 允许跨脚本先插子行后补父行的合法修复。
+                conn.set_authorizer(_allow_all)
+                violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    detail = ", ".join(
+                        f"table={v[0]} rowid={v[1]} target={v[2]} fkid={v[3]}"
+                        for v in violations[:5]
+                    )
+                    raise ScriptFailed(
+                        pending[-1].version, f"foreign key violation: {detail}"
+                    )
                 conn.execute("COMMIT")
             except Exception:
                 try:
@@ -223,7 +232,7 @@ def _apply_locked(db_path: Path, manifest: MigrationManifest) -> ApplyResult:
                     pass
                 raise
             finally:
-                conn.set_authorizer(_allow_all)
+                conn.set_authorizer(None)
 
             return ApplyResult(
                 before_version=before,

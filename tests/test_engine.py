@@ -121,10 +121,8 @@ def test_failure_rolls_back_whole_batch(db):
     conn = sqlite3.connect(db)
     names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
     assert "ok" not in names
-    assert conn.execute(
-        f"SELECT COUNT(*) FROM {MIGRATION_TABLE}"
-    ).fetchone()[0] == 0
     conn.close()
+    assert status(db)["current_version"] == 0
 
 
 def test_foreign_key_violation_rollback(tmp_path):
